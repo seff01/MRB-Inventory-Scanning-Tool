@@ -756,7 +756,7 @@ function buildXlsxWorksheetXml(rows) {
 </worksheet>`;
 }
 
-function buildExcelWorkbookXlsx(sheets) {
+function buildExcelWorkbookXlsx(sheets, embeddedRows = null) {
   const usedNames = new Set();
   const normalizedSheets = sheets.map((sheet, idx) => ({
     name: toXlsxSheetName(sheet?.name, idx, usedNames),
@@ -817,6 +817,13 @@ function buildExcelWorkbookXlsx(sheets) {
     { path: "xl/_rels/workbook.xml.rels", content: workbookRelsXml },
     { path: "xl/styles.xml", content: stylesXml }
   ];
+
+  if (Array.isArray(embeddedRows) && embeddedRows.length) {
+    files.push({
+      path: "mrb_export/scans.csv",
+      content: toCSV(embeddedRows)
+    });
+  }
 
   normalizedSheets.forEach((sheet, idx) => {
     files.push({
@@ -1158,6 +1165,15 @@ async function parseXlsxRows(arrayBuffer) {
     return bytes ? new TextDecoder("utf-8").decode(bytes) : "";
   };
 
+  // Fast path: files exported by this app embed an import-friendly CSV payload.
+  const embeddedCsvPath = findEntry("mrb_export/scans.csv");
+  if (embeddedCsvPath) {
+    const embeddedCsvBytes = entries.get(embeddedCsvPath);
+    const embeddedCsvText = embeddedCsvBytes ? new TextDecoder("utf-8").decode(embeddedCsvBytes) : "";
+    const embeddedRows = parseCsv(embeddedCsvText);
+    if (embeddedRows.length) return embeddedRows;
+  }
+
   const workbookXmlText = getText("xl/workbook.xml");
   const workbookRelsText = getText("xl/_rels/workbook.xml.rels");
   if (!workbookXmlText || !workbookRelsText) {
@@ -1258,7 +1274,8 @@ async function handleImportFile(file) {
     importScansFromRows(rows);
   } catch (e) {
     console.error(e);
-    setStatus("Import failed. The file could not be read.", "err");
+    const reason = (e && typeof e.message === "string" && e.message.trim()) ? ` Reason: ${e.message}` : "";
+    setStatus(`Import failed. The file could not be read.${reason}`, "err");
   } finally {
     if (importFileInput) importFileInput.value = "";
   }
@@ -1289,10 +1306,23 @@ document.getElementById("exportSummaryBtn").addEventListener("click", () => {
     rackRows.push(["(No racks scanned)","","","","","",""]);
   }
 
+  const embeddedImportRows = [["Timestamp","Serial Number","PN-R","Initials","Rack","Lookup Found","Duplicate"]];
+  for (const r of scans) {
+    embeddedImportRows.push([
+      r.ts || "",
+      r.serial || "",
+      r.pnr || "",
+      r.initials || "",
+      r.rack || "",
+      r.lookupFound ? "Yes" : "No",
+      r.duplicate ? "Yes" : "No"
+    ]);
+  }
+
   const workbookXlsx = buildExcelWorkbookXlsx([
     { name: "Summary By PN-R", rows: summaryRows },
     { name: "Racks", rows: rackRows }
-  ]);
+  ], embeddedImportRows);
 
   downloadFile("inventory_summary.xlsx", workbookXlsx, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
   setStatus("Exported Excel .xlsx file with Summary By PN-R and Racks sheets.", "ok");
