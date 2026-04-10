@@ -989,35 +989,89 @@ function parseSpreadsheetMlRows(xmlText) {
   });
 }
 
-function decodeZipEntries(zipBytes) {
+function normalizeZipPath(path) {
+  const parts = [];
+  (path || "").replace(/\\/g, "/").split("/").forEach(part => {
+    if (!part || part === ".") return;
+    if (part === "..") {
+      if (parts.length) parts.pop();
+      return;
+    }
+    parts.push(part);
+  });
+  return parts.join("/");
+}
+
+async function inflateDeflate(bytes) {
+  if (typeof DecompressionStream !== "function") {
+    throw new Error("This browser cannot decompress standard XLSX ZIP entries.");
+  }
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+function findZipEndOfCentralDirectory(dv, totalLen) {
+  const minOffset = Math.max(0, totalLen - 65557);
+  for (let i = Math.max(0, totalLen - 22); i >= minOffset; i--) {
+    if (dv.getUint32(i, true) === 0x06054B50) return i;
+  }
+  return -1;
+}
+
+async function decodeZipEntries(zipBytes) {
   const dv = new DataView(zipBytes.buffer, zipBytes.byteOffset, zipBytes.byteLength);
   const files = new Map();
   const decoder = new TextDecoder("utf-8");
-  let offset = 0;
+  const eocdOffset = findZipEndOfCentralDirectory(dv, zipBytes.length);
+  if (eocdOffset < 0) throw new Error("Invalid XLSX ZIP file (missing end of central directory).");
 
-  while (offset + 4 <= zipBytes.length) {
-    const signature = dv.getUint32(offset, true);
-    if (signature === 0x04034B50) {
-      if (offset + 30 > zipBytes.length) throw new Error("Invalid XLSX ZIP header.");
-      const flags = dv.getUint16(offset + 6, true);
-      const method = dv.getUint16(offset + 8, true);
-      const compressedSize = dv.getUint32(offset + 18, true);
-      const nameLen = dv.getUint16(offset + 26, true);
-      const extraLen = dv.getUint16(offset + 28, true);
-      const nameStart = offset + 30;
-      const nameEnd = nameStart + nameLen;
-      const dataStart = nameEnd + extraLen;
-      const dataEnd = dataStart + compressedSize;
-      if (dataEnd > zipBytes.length) throw new Error("Invalid XLSX ZIP file structure.");
-      if ((flags & 0x0008) !== 0) throw new Error("Unsupported XLSX ZIP format (data descriptor).");
-      if (method !== 0) throw new Error("Unsupported XLSX compression method in this file.");
-      const path = decoder.decode(zipBytes.slice(nameStart, nameEnd));
-      files.set(path.replace(/\\/g, "/"), zipBytes.slice(dataStart, dataEnd));
-      offset = dataEnd;
-      continue;
+  const totalEntries = dv.getUint16(eocdOffset + 10, true);
+  const centralSize = dv.getUint32(eocdOffset + 12, true);
+  const centralOffset = dv.getUint32(eocdOffset + 16, true);
+  if (centralOffset + centralSize > zipBytes.length) throw new Error("Invalid XLSX ZIP central directory.");
+
+  let offset = centralOffset;
+  for (let i = 0; i < totalEntries; i++) {
+    if (offset + 46 > zipBytes.length || dv.getUint32(offset, true) !== 0x02014B50) {
+      throw new Error("Invalid XLSX ZIP central directory entry.");
     }
-    if (signature === 0x02014B50 || signature === 0x06054B50) break;
-    throw new Error("Unsupported XLSX ZIP structure.");
+    const flags = dv.getUint16(offset + 8, true);
+    const method = dv.getUint16(offset + 10, true);
+    const compressedSize = dv.getUint32(offset + 20, true);
+    const uncompressedSize = dv.getUint32(offset + 24, true);
+    const nameLen = dv.getUint16(offset + 28, true);
+    const extraLen = dv.getUint16(offset + 30, true);
+    const commentLen = dv.getUint16(offset + 32, true);
+    const localHeaderOffset = dv.getUint32(offset + 42, true);
+    const nameStart = offset + 46;
+    const nameEnd = nameStart + nameLen;
+    if (nameEnd > zipBytes.length) throw new Error("Invalid XLSX ZIP path entry.");
+    const path = normalizeZipPath(decoder.decode(zipBytes.slice(nameStart, nameEnd)));
+
+    if (localHeaderOffset + 30 > zipBytes.length || dv.getUint32(localHeaderOffset, true) !== 0x04034B50) {
+      throw new Error("Invalid XLSX ZIP local header.");
+    }
+    const localNameLen = dv.getUint16(localHeaderOffset + 26, true);
+    const localExtraLen = dv.getUint16(localHeaderOffset + 28, true);
+    const dataStart = localHeaderOffset + 30 + localNameLen + localExtraLen;
+    const dataEnd = dataStart + compressedSize;
+    if (dataEnd > zipBytes.length) throw new Error("Invalid XLSX ZIP file payload.");
+    const compressedData = zipBytes.slice(dataStart, dataEnd);
+
+    let dataBytes;
+    if (method === 0) {
+      dataBytes = compressedData;
+    } else if (method === 8) {
+      dataBytes = await inflateDeflate(compressedData);
+    } else {
+      throw new Error(`Unsupported XLSX compression method: ${method}.`);
+    }
+
+    if (uncompressedSize !== 0 && dataBytes.length !== uncompressedSize) {
+      throw new Error("Invalid XLSX ZIP entry size.");
+    }
+    if (path) files.set(path, dataBytes);
+    offset = nameEnd + extraLen + commentLen;
   }
 
   return files;
@@ -1045,11 +1099,18 @@ function xlsxColRefToIndex(cellRef) {
   return Math.max(1, col);
 }
 
-function parseXlsxRows(arrayBuffer) {
+function resolveWorkbookTargetPath(targetRelPath) {
+  const normalizedTarget = normalizeZipPath((targetRelPath || "").replace(/^\/+/, ""));
+  if (!normalizedTarget) return "";
+  if (normalizedTarget.startsWith("xl/")) return normalizedTarget;
+  return normalizeZipPath(`xl/${normalizedTarget}`);
+}
+
+async function parseXlsxRows(arrayBuffer) {
   const zipBytes = new Uint8Array(arrayBuffer);
-  const entries = decodeZipEntries(zipBytes);
+  const entries = await decodeZipEntries(zipBytes);
   const getText = (path) => {
-    const bytes = entries.get(path);
+    const bytes = entries.get(normalizeZipPath(path));
     return bytes ? new TextDecoder("utf-8").decode(bytes) : "";
   };
 
@@ -1084,7 +1145,7 @@ function parseXlsxRows(arrayBuffer) {
 
   const targetRel = relMap.get(targetSheet.relId);
   if (!targetRel) throw new Error("Could not locate worksheet path in XLSX file.");
-  const targetPath = `xl/${targetRel}`.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/^\.?\//, "");
+  const targetPath = resolveWorkbookTargetPath(targetRel);
   const worksheetXmlText = getText(targetPath);
   if (!worksheetXmlText) throw new Error("Could not read worksheet data from XLSX file.");
 
