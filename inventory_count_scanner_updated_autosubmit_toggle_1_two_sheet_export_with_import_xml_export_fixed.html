@@ -636,11 +636,9 @@ function buildExcelWorkbookXml(sheets) {
         return `<Cell${style}><Data ss:Type="${type}">${xmlEscape(cell)}</Data></Cell>`;
       }).join("");
       return `<Row>${cellsXml}</Row>`;
-    }).join("
-");
+    }).join("\n");
     return `<Worksheet ss:Name="${xmlEscape(sheet.name).slice(0,31)}"><Table>${rowsXml}</Table></Worksheet>`;
-  }).join("
-");
+  }).join("\n");
 
   return `${workbookStart}
 ${sheetXml}
