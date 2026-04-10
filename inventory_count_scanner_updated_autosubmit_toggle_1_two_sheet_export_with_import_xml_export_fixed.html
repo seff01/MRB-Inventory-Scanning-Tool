@@ -782,7 +782,7 @@ function parseSpreadsheetMlRows(xmlText) {
   }
 
   const worksheets = Array.from(xml.getElementsByTagNameNS("urn:schemas-microsoft-com:office:spreadsheet", "Worksheet"));
-  let target = worksheets.find(ws => /exported scans/i.test(ws.getAttribute("ss:Name") || ws.getAttribute("Name") || ""));
+  let target = worksheets.find(ws => /(?:exported scans|racks)/i.test(ws.getAttribute("ss:Name") || ws.getAttribute("Name") || ""));
   if (!target) target = worksheets[0];
   if (!target) return [];
 
@@ -835,31 +835,37 @@ async function handleImportFile(file) {
 }
 
 document.getElementById("exportSummaryBtn").addEventListener("click", () => {
-  const detailRows = [["Timestamp","PN-R","Count","Serial Number","Initials","Rack"]];
-  for (const r of scans) {
-    const pnrKey = (r.pnr || "(BLANK)").trim() || "(BLANK)";
-    detailRows.push([
-      r.ts || nowStamp(),
-      pnrKey,
-      1,
-      r.serial || "",
-      r.initials || "",
-      r.rack || ""
-    ]);
-  }
-
   const summaryRows = [["PN-R","Count"]];
   for (const row of getSummaryRows()) {
     summaryRows.push([row.pnr, row.count]);
   }
 
+  const rackRows = [["Rack","Timestamp","Serial Number","PN-R","Initials","Duplicate","Lookup Found"]];
+  for (const group of getRackGroups()) {
+    const rows = group.rows.slice().reverse();
+    rows.forEach((r, idx) => {
+      rackRows.push([
+        idx === 0 ? group.rack : "",
+        r.ts || "",
+        r.serial || "",
+        r.pnr || "",
+        r.initials || "",
+        r.duplicate ? "Yes" : "No",
+        r.lookupFound ? "Yes" : "No"
+      ]);
+    });
+  }
+  if (rackRows.length === 1) {
+    rackRows.push(["(No racks scanned)","","","","","",""]);
+  }
+
   const workbookXml = buildExcelWorkbookXml([
-    { name: "Exported Scans", rows: detailRows },
-    { name: "Summary By PN-R", rows: summaryRows }
+    { name: "Summary By PN-R", rows: summaryRows },
+    { name: "Racks", rows: rackRows }
   ]);
 
-  downloadFile("inventory_summary.xml", workbookXml, "application/xml;charset=utf-8");
-  setStatus("Exported Excel XML file with Exported Scans and Summary By PN-R sheets.", "ok");
+  downloadFile("inventory_summary.xls", workbookXml, "application/vnd.ms-excel;charset=utf-8");
+  setStatus("Exported Excel .xls file with Summary By PN-R and Racks sheets.", "ok");
 });
 
 document.getElementById("copySummaryBtn").addEventListener("click", async () => {
@@ -868,7 +874,7 @@ document.getElementById("copySummaryBtn").addEventListener("click", async () => 
     await navigator.clipboard.writeText(text);
     setStatus("Summary copied to clipboard (CSV format).", "ok");
   } catch {
-    setStatus("Clipboard copy failed in this browser. Use Export Excel XML instead.", "warn");
+    setStatus("Clipboard copy failed in this browser. Use Export Excel (.xls) instead.", "warn");
   }
 });
 
