@@ -105,7 +105,7 @@
       <button id="undoBtn">Undo Last</button>
       <button id="clearBtn" class="danger">Clear All</button>
       <button id="loadLookupBtn" class="secondary">Load Lookup File</button>
-      <input id="lookupFileInput" type="file" accept=".csv,.txt,.xls,.xml" class="hidden" />
+      <input id="lookupFileInput" type="file" accept=".csv,.txt,.xls,.xml,.xlsx" class="hidden" />
       <button id="clearLookupBtn">Clear Lookup</button>
     </div>
 
@@ -745,6 +745,284 @@ function parseSpreadsheetMlRowsBySheet(xmlText) {
   return out;
 }
 
+function normalizeZipPath(path) {
+  const parts = [];
+  (path || "").replace(/\\/g, "/").split("/").forEach(part => {
+    if (!part || part === ".") return;
+    if (part === "..") {
+      if (parts.length) parts.pop();
+      return;
+    }
+    parts.push(part);
+  });
+  return parts.join("/");
+}
+
+async function inflateDeflate(bytes) {
+  if (typeof DecompressionStream !== "function") {
+    throw new Error("This browser cannot decompress XLSX files.");
+  }
+  try {
+    const deflateStream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate"));
+    return new Uint8Array(await new Response(deflateStream).arrayBuffer());
+  } catch (deflateErr) {
+    try {
+      const rawStream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+      return new Uint8Array(await new Response(rawStream).arrayBuffer());
+    } catch {
+      throw deflateErr;
+    }
+  }
+}
+
+async function decodeZipEntriesFromLocalHeaders(zipBytes) {
+  const dv = new DataView(zipBytes.buffer, zipBytes.byteOffset, zipBytes.byteLength);
+  const files = new Map();
+  const decoder = new TextDecoder("utf-8");
+  let offset = 0;
+
+  while (offset + 30 <= zipBytes.length) {
+    const signature = dv.getUint32(offset, true);
+    if (signature !== 0x04034B50) break;
+
+    const method = dv.getUint16(offset + 8, true);
+    const compressedSize = dv.getUint32(offset + 18, true);
+    const nameLen = dv.getUint16(offset + 26, true);
+    const extraLen = dv.getUint16(offset + 28, true);
+    const nameStart = offset + 30;
+    const nameEnd = nameStart + nameLen;
+    const dataStart = nameEnd + extraLen;
+    const dataEnd = dataStart + compressedSize;
+
+    if (nameEnd > zipBytes.length || dataEnd > zipBytes.length) {
+      throw new Error("Invalid XLSX ZIP local-header structure.");
+    }
+
+    const path = normalizeZipPath(decoder.decode(zipBytes.slice(nameStart, nameEnd)));
+    const compressedData = zipBytes.slice(dataStart, dataEnd);
+    let dataBytes;
+    if (method === 0) dataBytes = compressedData;
+    else if (method === 8) dataBytes = await inflateDeflate(compressedData);
+    else throw new Error(`Unsupported XLSX compression method: ${method}.`);
+
+    if (path) files.set(path, dataBytes);
+    offset = dataEnd;
+  }
+
+  if (!files.size) throw new Error("Could not decode XLSX ZIP local entries.");
+  return files;
+}
+
+function findZipEndOfCentralDirectory(dv, totalLen) {
+  const minOffset = Math.max(0, totalLen - 65557);
+  for (let i = Math.max(0, totalLen - 22); i >= minOffset; i--) {
+    if (dv.getUint32(i, true) === 0x06054B50) return i;
+  }
+  return -1;
+}
+
+async function decodeZipEntries(zipBytes) {
+  try {
+    const dv = new DataView(zipBytes.buffer, zipBytes.byteOffset, zipBytes.byteLength);
+    const files = new Map();
+    const decoder = new TextDecoder("utf-8");
+    const zip64LocatorLength = 20;
+    const zip64EocdMinLength = 56;
+    const eocdOffset = findZipEndOfCentralDirectory(dv, zipBytes.length);
+    if (eocdOffset < 0) throw new Error("Invalid XLSX ZIP file (missing end of central directory).");
+
+    let totalEntries = dv.getUint16(eocdOffset + 10, true);
+    let centralSize = dv.getUint32(eocdOffset + 12, true);
+    let centralOffset = dv.getUint32(eocdOffset + 16, true);
+
+    const usesZip64 = totalEntries === 0xFFFF || centralSize === 0xFFFFFFFF || centralOffset === 0xFFFFFFFF;
+    if (usesZip64) {
+      const locatorOffset = eocdOffset - zip64LocatorLength;
+      if (locatorOffset < 0 || dv.getUint32(locatorOffset, true) !== 0x07064B50) {
+        throw new Error("Invalid XLSX ZIP64 locator.");
+      }
+      const zip64EocdOffset = Number(dv.getBigUint64(locatorOffset + 8, true));
+      if (zip64EocdOffset < 0 || zip64EocdOffset + zip64EocdMinLength > zipBytes.length) {
+        throw new Error("Invalid XLSX ZIP64 EOCD offset.");
+      }
+      if (dv.getUint32(zip64EocdOffset, true) !== 0x06064B50) {
+        throw new Error("Invalid XLSX ZIP64 EOCD signature.");
+      }
+      totalEntries = Number(dv.getBigUint64(zip64EocdOffset + 32, true));
+      centralSize = Number(dv.getBigUint64(zip64EocdOffset + 40, true));
+      centralOffset = Number(dv.getBigUint64(zip64EocdOffset + 48, true));
+    }
+
+    if (!Number.isFinite(totalEntries) || totalEntries < 0) throw new Error("Invalid XLSX ZIP entry count.");
+    if (!Number.isFinite(centralSize) || centralSize < 0) throw new Error("Invalid XLSX ZIP central directory size.");
+    if (!Number.isFinite(centralOffset) || centralOffset < 0) throw new Error("Invalid XLSX ZIP central directory offset.");
+    if (centralOffset + centralSize > zipBytes.length) throw new Error("Invalid XLSX ZIP central directory.");
+
+    let offset = centralOffset;
+    for (let i = 0; i < totalEntries; i++) {
+      if (offset + 46 > zipBytes.length || dv.getUint32(offset, true) !== 0x02014B50) {
+        throw new Error("Invalid XLSX ZIP central directory entry.");
+      }
+      const method = dv.getUint16(offset + 10, true);
+      const compressedSize = dv.getUint32(offset + 20, true);
+      const uncompressedSize = dv.getUint32(offset + 24, true);
+      const nameLen = dv.getUint16(offset + 28, true);
+      const extraLen = dv.getUint16(offset + 30, true);
+      const commentLen = dv.getUint16(offset + 32, true);
+      const localHeaderOffset = dv.getUint32(offset + 42, true);
+      const nameStart = offset + 46;
+      const nameEnd = nameStart + nameLen;
+      if (nameEnd > zipBytes.length) throw new Error("Invalid XLSX ZIP path entry.");
+      const path = normalizeZipPath(decoder.decode(zipBytes.slice(nameStart, nameEnd)));
+
+      if (localHeaderOffset + 30 > zipBytes.length || dv.getUint32(localHeaderOffset, true) !== 0x04034B50) {
+        throw new Error("Invalid XLSX ZIP local header.");
+      }
+      const localNameLen = dv.getUint16(localHeaderOffset + 26, true);
+      const localExtraLen = dv.getUint16(localHeaderOffset + 28, true);
+      const dataStart = localHeaderOffset + 30 + localNameLen + localExtraLen;
+      const dataEnd = dataStart + compressedSize;
+      if (dataEnd > zipBytes.length) throw new Error("Invalid XLSX ZIP file payload.");
+      const compressedData = zipBytes.slice(dataStart, dataEnd);
+
+      let dataBytes;
+      if (method === 0) {
+        dataBytes = compressedData;
+      } else if (method === 8) {
+        dataBytes = await inflateDeflate(compressedData);
+      } else {
+        throw new Error(`Unsupported XLSX compression method: ${method}.`);
+      }
+
+      if (uncompressedSize !== 0 && dataBytes.length !== uncompressedSize) {
+        throw new Error("Invalid XLSX ZIP entry size.");
+      }
+      if (path) files.set(path, dataBytes);
+      offset = nameEnd + extraLen + commentLen;
+    }
+
+    return files;
+  } catch {
+    return decodeZipEntriesFromLocalHeaders(zipBytes);
+  }
+}
+
+function parseXmlOrThrow(xmlText, errorMessage) {
+  const parser = new DOMParser();
+  const xml = parser.parseFromString(xmlText, "application/xml");
+  if (xml.querySelector("parsererror")) throw new Error(errorMessage);
+  return xml;
+}
+
+function readXlsxSharedStringItem(siNode) {
+  const ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+  const tNodes = Array.from(siNode.getElementsByTagNameNS(ns, "t"));
+  if (!tNodes.length) return "";
+  return tNodes.map(n => n.textContent || "").join("");
+}
+
+function xlsxColRefToIndex(cellRef) {
+  const m = /^([A-Z]+)/i.exec(cellRef || "");
+  if (!m) return 1;
+  const letters = m[1].toUpperCase();
+  let col = 0;
+  for (let i = 0; i < letters.length; i++) col = (col * 26) + (letters.charCodeAt(i) - 64);
+  return Math.max(1, col);
+}
+
+function resolveWorkbookTargetPath(targetRelPath) {
+  const normalizedTarget = normalizeZipPath((targetRelPath || "").replace(/^\/+/, ""));
+  if (!normalizedTarget) return "";
+  if (normalizedTarget.startsWith("xl/")) return normalizedTarget;
+  return normalizeZipPath(`xl/${normalizedTarget}`);
+}
+
+async function parseXlsxRowsBySheet(arrayBuffer) {
+  const ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+  const relNs = "http://schemas.openxmlformats.org/package/2006/relationships";
+  const docRelNs = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+
+  const entries = await decodeZipEntries(new Uint8Array(arrayBuffer));
+  const entryList = Array.from(entries.keys());
+  const findEntry = (candidate) => {
+    const normalized = normalizeZipPath(candidate);
+    if (!normalized) return "";
+    if (entries.has(normalized)) return normalized;
+    const lowered = normalized.toLowerCase();
+    const ciMatch = entryList.find(p => p.toLowerCase() === lowered);
+    return ciMatch || "";
+  };
+  const getText = (path) => {
+    const found = findEntry(path);
+    const bytes = found ? entries.get(found) : null;
+    return bytes ? new TextDecoder("utf-8").decode(bytes) : "";
+  };
+
+  const workbookXmlText = getText("xl/workbook.xml");
+  const workbookRelsText = getText("xl/_rels/workbook.xml.rels");
+  if (!workbookXmlText || !workbookRelsText) throw new Error("Invalid XLSX workbook metadata.");
+
+  const workbookXml = parseXmlOrThrow(workbookXmlText, "Invalid XLSX workbook.xml.");
+  const relsXml = parseXmlOrThrow(workbookRelsText, "Invalid XLSX workbook relationships.");
+
+  const relMap = new Map();
+  Array.from(relsXml.getElementsByTagNameNS(relNs, "Relationship")).forEach(rel => {
+    const id = rel.getAttribute("Id");
+    const target = rel.getAttribute("Target");
+    if (id && target) relMap.set(id, target);
+  });
+
+  const sharedStrings = [];
+  const sharedText = getText("xl/sharedStrings.xml");
+  if (sharedText) {
+    const sharedXml = parseXmlOrThrow(sharedText, "Invalid XLSX shared strings.");
+    Array.from(sharedXml.getElementsByTagNameNS(ns, "si")).forEach(si => {
+      sharedStrings.push(readXlsxSharedStringItem(si));
+    });
+  }
+
+  const sheets = Array.from(workbookXml.getElementsByTagNameNS(ns, "sheet")).map((sheet, idx) => ({
+    name: sheet.getAttribute("name") || `Sheet${idx + 1}`,
+    relId: sheet.getAttributeNS(docRelNs, "id") || sheet.getAttribute("r:id") || ""
+  }));
+
+  return sheets.map(sheet => {
+    const targetRel = relMap.get(sheet.relId);
+    if (!targetRel) return { name: sheet.name, rows: [] };
+    const worksheetXmlText = getText(resolveWorkbookTargetPath(targetRel));
+    if (!worksheetXmlText) return { name: sheet.name, rows: [] };
+
+    const sheetXml = parseXmlOrThrow(worksheetXmlText, "Invalid XLSX worksheet XML.");
+    const rowNodes = Array.from(sheetXml.getElementsByTagNameNS(ns, "row"));
+    const rows = rowNodes.map(row => {
+      const out = [];
+      const cells = Array.from(row.getElementsByTagNameNS(ns, "c"));
+      cells.forEach(cell => {
+        const colIndex = xlsxColRefToIndex(cell.getAttribute("r")) - 1;
+        while (out.length < colIndex) out.push("");
+        const type = cell.getAttribute("t") || "";
+        let value = "";
+        if (type === "inlineStr") {
+          const textNodes = Array.from(cell.getElementsByTagNameNS(ns, "t"));
+          value = textNodes.map(n => n.textContent || "").join("");
+        } else {
+          const vNode = cell.getElementsByTagNameNS(ns, "v")[0];
+          const raw = (vNode?.textContent || "").trim();
+          if (type === "s") {
+            const idx = Number.parseInt(raw, 10);
+            value = Number.isInteger(idx) ? (sharedStrings[idx] ?? "") : "";
+          } else {
+            value = raw;
+          }
+        }
+        out[colIndex] = value;
+      });
+      return out;
+    });
+    return { name: sheet.name, rows };
+  });
+}
+
 function parseLookupMapFromRows(rows) {
   if (!rows.length) return { map: {}, pairCount: 0, skippedBlank: 0, conflicts: 0 };
   const headerMap = {};
@@ -795,11 +1073,26 @@ async function handleLookupFileUpload(file) {
   if (!file) return;
   const name = (file.name || "").toLowerCase();
   try {
-    const text = (await file.text()).replace(/^﻿/, "");
     let parsed = { map: {}, pairCount: 0, skippedBlank: 0, conflicts: 0 };
     if (name.endsWith(".csv") || name.endsWith(".txt")) {
+      const text = (await file.text()).replace(/^﻿/, "");
       parsed = parseLookupMapFromRows(parseCsv(text));
+    } else if (name.endsWith(".xlsx")) {
+      const sheets = await parseXlsxRowsBySheet(await file.arrayBuffer());
+      const aggregate = {};
+      let pairCount = 0;
+      let skippedBlank = 0;
+      let conflicts = 0;
+      sheets.forEach(sheet => {
+        const part = parseLookupMapFromRows(sheet.rows || []);
+        pairCount += part.pairCount;
+        skippedBlank += part.skippedBlank;
+        conflicts += part.conflicts;
+        conflicts += mergeLookupMaps(aggregate, part.map);
+      });
+      parsed = { map: aggregate, pairCount, skippedBlank, conflicts };
     } else if (name.endsWith(".xls") || name.endsWith(".xml")) {
+      const text = (await file.text()).replace(/^﻿/, "");
       const sheets = parseSpreadsheetMlRowsBySheet(text);
       const aggregate = {};
       let pairCount = 0;
@@ -814,7 +1107,7 @@ async function handleLookupFileUpload(file) {
       });
       parsed = { map: aggregate, pairCount, skippedBlank, conflicts };
     } else {
-      setStatus("Unsupported lookup file. Use CSV/TXT or SpreadsheetML XLS/XML.", "err");
+      setStatus("Unsupported lookup file. Use CSV/TXT/XLSX or SpreadsheetML XLS/XML.", "err");
       return;
     }
 
