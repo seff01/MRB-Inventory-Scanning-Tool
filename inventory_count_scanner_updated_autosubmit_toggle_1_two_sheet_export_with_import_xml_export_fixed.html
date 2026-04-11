@@ -131,6 +131,11 @@
     </div>
 
     <div id="racksTab" class="tab-panel">
+      <div class="controls2">
+        <button id="importMergeBtn">Import & Merge Data</button>
+        <input id="importMergeFileInput" type="file" accept=".xls,.xml" class="hidden" />
+        <button id="exportDataBtn" class="secondary">Export Data</button>
+      </div>
       <div class="table-wrap">
         <table id="racksTable">
           <thead>
@@ -165,6 +170,9 @@ const addRackBtn = document.getElementById("addRackBtn");
 const addBtn = document.getElementById("addBtn");
 const undoBtn = document.getElementById("undoBtn");
 const clearBtn = document.getElementById("clearBtn");
+const importMergeBtn = document.getElementById("importMergeBtn");
+const importMergeFileInput = document.getElementById("importMergeFileInput");
+const exportDataBtn = document.getElementById("exportDataBtn");
 const statusMsg = document.getElementById("statusMsg");
 const totalScansEl = document.getElementById("totalScans");
 const uniqueSerialsEl = document.getElementById("uniqueSerials");
@@ -568,6 +576,252 @@ function escapeHtml(s) {
     .replace(/'/g,"&#039;");
 }
 
+function xmlEscape(value) {
+  return (value ?? "").toString()
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function buildSpreadsheetMlWorkbook(sheets) {
+  const workbookStart = `<?xml version="1.0"?>
+<?mso-application progid="Excel.Sheet"?>
+<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet" xmlns:html="http://www.w3.org/TR/REC-html40">
+<Styles>
+  <Style ss:ID="Default" ss:Name="Normal">
+    <Alignment ss:Vertical="Bottom"/>
+    <Borders/>
+    <Font/>
+    <Interior/>
+    <NumberFormat/>
+    <Protection/>
+  </Style>
+  <Style ss:ID="Header">
+    <Font ss:Bold="1"/>
+    <Interior ss:Color="#D9EAF7" ss:Pattern="Solid"/>
+  </Style>
+</Styles>`;
+
+  const sheetXml = sheets.map(sheet => {
+    const rowsXml = sheet.rows.map((row, rowIndex) => {
+      const cellsXml = row.map(cell => {
+        const isNum = typeof cell === "number" && Number.isFinite(cell);
+        const type = isNum ? "Number" : "String";
+        const style = rowIndex === 0 ? ` ss:StyleID="Header"` : "";
+        return `<Cell${style}><Data ss:Type="${type}">${xmlEscape(cell)}</Data></Cell>`;
+      }).join("");
+      return `<Row>${cellsXml}</Row>`;
+    }).join("\n");
+    return `<Worksheet ss:Name="${xmlEscape((sheet.name || "Sheet").slice(0, 31))}"><Table>${rowsXml}</Table></Worksheet>`;
+  }).join("\n");
+
+  return `${workbookStart}\n${sheetXml}\n</Workbook>`;
+}
+
+function downloadFile(filename, content, type = "text/plain;charset=utf-8") {
+  const blob = new Blob([content], { type });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function parseSpreadsheetMlRowsBySheet(xmlText) {
+  const parser = new DOMParser();
+  const xml = parser.parseFromString(xmlText, "application/xml");
+  if (xml.querySelector("parsererror")) throw new Error("Invalid SpreadsheetML XML.");
+  const ns = "urn:schemas-microsoft-com:office:spreadsheet";
+  const worksheets = Array.from(xml.getElementsByTagNameNS(ns, "Worksheet"));
+  const out = [];
+  worksheets.forEach(ws => {
+    const name = ws.getAttribute("ss:Name") || ws.getAttribute("Name") || "Sheet";
+    const rowNodes = Array.from(ws.getElementsByTagNameNS(ns, "Row"));
+    const rows = rowNodes.map(row => {
+      const values = [];
+      let currentIndex = 1;
+      const cells = Array.from(row.getElementsByTagNameNS(ns, "Cell"));
+      cells.forEach(cell => {
+        const idxAttr = cell.getAttribute("ss:Index") || cell.getAttribute("Index");
+        const targetIndex = idxAttr ? Number.parseInt(idxAttr, 10) : currentIndex;
+        while (currentIndex < targetIndex) {
+          values.push("");
+          currentIndex++;
+        }
+        const dataNode = cell.getElementsByTagNameNS(ns, "Data")[0];
+        values.push(dataNode ? (dataNode.textContent || "") : "");
+        currentIndex++;
+      });
+      return values;
+    });
+    out.push({ name, rows });
+  });
+  return out;
+}
+
+function normalizeImportHeader(value) {
+  return normalize(value).replace(/[^A-Z0-9]+/g, "");
+}
+
+function parseRecordsFromRows(rows) {
+  if (!rows.length) return { records: [], skippedBlank: 0 };
+  const headerMap = {};
+  rows[0].forEach((h, i) => {
+    const key = normalizeImportHeader(h);
+    if (key) headerMap[key] = i;
+  });
+  const get = (row, keys) => {
+    for (const key of keys) {
+      if (headerMap[key] != null) return row[headerMap[key]] ?? "";
+    }
+    return "";
+  };
+
+  const serialKeys = ["SERIALNUMBER", "SERIAL", "SN"];
+  const pnrKeys = ["PNR", "PNRGPN", "GPN", "PN"];
+  const initialsKeys = ["INITIALS", "USERINITIALS", "OPERATOR", "TECHNICIAN"];
+  const rackKeys = ["RACK", "RACKID", "RACKNAME"];
+  const tsKeys = ["TIMESTAMP", "TIME", "DATE", "DATETIME"];
+  const lookupKeys = ["LOOKUPFOUND", "LOOKUP", "FOUNDINLOOKUP"];
+  const duplicateKeys = ["DUPLICATE", "ISDUPLICATE"];
+
+  if (!serialKeys.some(k => headerMap[k] != null)) return { records: [], skippedBlank: rows.length > 1 ? rows.length - 1 : 0 };
+
+  let skippedBlank = 0;
+  const records = [];
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i];
+    const serial = normalize(get(row, serialKeys));
+    if (!serial) {
+      skippedBlank++;
+      continue;
+    }
+    const rawLookup = normalize(get(row, lookupKeys));
+    const rawDup = normalize(get(row, duplicateKeys));
+    records.push({
+      ts: (get(row, tsKeys) || "").toString().trim() || nowStamp(),
+      serial,
+      pnr: normalize(get(row, pnrKeys)),
+      initials: normalize(get(row, initialsKeys)),
+      rack: normalize(get(row, rackKeys)),
+      lookupFound: rawLookup === "YES" || rawLookup === "TRUE" || rawLookup === "1",
+      duplicate: rawDup === "YES" || rawDup === "TRUE" || rawDup === "1"
+    });
+  }
+  return { records, skippedBlank };
+}
+
+function mergeImportedRecords(records, skippedBlank = 0) {
+  const bySerial = new Map(scans.map(row => [normalize(row.serial), row]));
+  let added = 0;
+  let updated = 0;
+  let skippedDupes = 0;
+
+  records.forEach(record => {
+    const key = normalize(record.serial);
+    if (!key) return;
+    const existing = bySerial.get(key);
+    if (!existing) {
+      const lookedUp = normalize(SERIAL_TO_PNR[key] || "");
+      scans.push({
+        ts: record.ts || nowStamp(),
+        serial: key,
+        pnr: record.pnr || lookedUp,
+        initials: record.initials || "",
+        rack: record.rack || "",
+        lookupFound: record.lookupFound || !!lookedUp,
+        duplicate: !!record.duplicate
+      });
+      bySerial.set(key, scans[scans.length - 1]);
+      added++;
+      return;
+    }
+
+    let changed = false;
+    if (!existing.pnr && record.pnr) { existing.pnr = record.pnr; changed = true; }
+    if (!existing.initials && record.initials) { existing.initials = record.initials; changed = true; }
+    if (!existing.rack && record.rack) { existing.rack = record.rack; changed = true; }
+    if (!existing.ts && record.ts) { existing.ts = record.ts; changed = true; }
+    if (record.lookupFound && !existing.lookupFound) { existing.lookupFound = true; changed = true; }
+    if (record.duplicate && !existing.duplicate) { existing.duplicate = true; changed = true; }
+    if (changed) updated++;
+    else skippedDupes++;
+  });
+
+  persistScans();
+  renderAll();
+  setStatus(`Merge complete. Added ${added}, updated ${updated}, skipped ${skippedDupes} duplicates, skipped ${skippedBlank} blank row(s).`, (added || updated) ? "ok" : "warn");
+}
+
+function exportDataWorkbook() {
+  const summaryRows = [["PN-R", "Count"], ...getSummaryRows().map(r => [r.pnr, r.count])];
+  const rackRows = [["Rack","Timestamp","Serial Number","PN-R","Initials","Duplicate","Lookup Found"]];
+  getRackGroups().forEach(group => {
+    group.rows.slice().reverse().forEach((r, idx) => {
+      rackRows.push([
+        idx === 0 ? group.rack : "",
+        r.ts || "",
+        r.serial || "",
+        r.pnr || "",
+        r.initials || "",
+        r.duplicate ? "Yes" : "No",
+        r.lookupFound ? "Yes" : "No"
+      ]);
+    });
+  });
+  if (rackRows.length === 1) rackRows.push(["(No racks scanned)","","","","","",""]);
+
+  const mergeRows = [["Timestamp","Serial Number","PN-R","Initials","Rack","Lookup Found","Duplicate"]];
+  scans.forEach(r => mergeRows.push([
+    r.ts || "",
+    r.serial || "",
+    r.pnr || "",
+    r.initials || "",
+    r.rack || "",
+    r.lookupFound ? "Yes" : "No",
+    r.duplicate ? "Yes" : "No"
+  ]));
+
+  const workbook = buildSpreadsheetMlWorkbook([
+    { name: "Summary By PN-R", rows: summaryRows },
+    { name: "Racks", rows: rackRows },
+    { name: "Merge Data", rows: mergeRows }
+  ]);
+  downloadFile(`inventory_merge_${Date.now()}.xls`, workbook, "application/vnd.ms-excel;charset=utf-8");
+  setStatus("Exported merge workbook (.xls) with Summary, Racks, and Merge Data sheets.", "ok");
+}
+
+async function handleImportMergeFile(file) {
+  if (!file) return;
+  try {
+    const text = (await file.text()).replace(/^﻿/, "");
+    const sheets = parseSpreadsheetMlRowsBySheet(text);
+    if (!sheets.length) {
+      setStatus("Import failed. No sheets found in the selected file.", "err");
+      return;
+    }
+    let target = sheets.find(s => /merge data/i.test(s.name));
+    if (!target) target = sheets.find(s => /racks|exported scans/i.test(s.name));
+    if (!target) target = sheets[0];
+    const { records, skippedBlank } = parseRecordsFromRows(target.rows || []);
+    if (!records.length) {
+      setStatus("Import failed. No readable scan rows were found in the file.", "err");
+      return;
+    }
+    mergeImportedRecords(records, skippedBlank);
+  } catch (e) {
+    console.error(e);
+    setStatus(`Import failed. ${(e && e.message) ? e.message : "The file could not be read."}`, "err");
+  } finally {
+    if (importMergeFileInput) importMergeFileInput.value = "";
+  }
+}
+
 let autoSubmitTimer = null;
 function cancelAutoSubmitTimer() {
   if (autoSubmitTimer) {
@@ -656,6 +910,11 @@ addRackBtn.addEventListener("click", addRack);
 addBtn.addEventListener("click", addEntry);
 undoBtn.addEventListener("click", undoLast);
 clearBtn.addEventListener("click", clearAll);
+if (exportDataBtn) exportDataBtn.addEventListener("click", exportDataWorkbook);
+if (importMergeBtn && importMergeFileInput) {
+  importMergeBtn.addEventListener("click", () => importMergeFileInput.click());
+  importMergeFileInput.addEventListener("change", (e) => handleImportMergeFile(e.target.files?.[0] || null));
+}
 if (filterInput) filterInput.addEventListener("input", renderDetails);
 
 if (racksTbody) {
