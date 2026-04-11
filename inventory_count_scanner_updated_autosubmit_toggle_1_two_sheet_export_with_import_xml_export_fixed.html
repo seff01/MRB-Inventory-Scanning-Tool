@@ -116,9 +116,6 @@
     </div>
 
     <div id="summaryTab" class="tab-panel hidden">
-      <div class="controls2">
-        <button id="copySummaryBtn">Copy Summary</button>
-      </div>
       <div class="table-wrap">
         <table id="summaryTable">
           <thead>
@@ -135,7 +132,9 @@
 
     <div id="racksTab" class="tab-panel">
       <div class="controls2">
-        <button id="exportSummaryBtn" class="secondary">Export Excel</button>
+        <button id="importMergeBtn">Import & Merge Data</button>
+        <input id="importMergeFileInput" type="file" accept=".xls,.xml" class="hidden" />
+        <button id="exportDataBtn" class="secondary">Export Data</button>
       </div>
       <div class="table-wrap">
         <table id="racksTable">
@@ -171,6 +170,9 @@ const addRackBtn = document.getElementById("addRackBtn");
 const addBtn = document.getElementById("addBtn");
 const undoBtn = document.getElementById("undoBtn");
 const clearBtn = document.getElementById("clearBtn");
+const importMergeBtn = document.getElementById("importMergeBtn");
+const importMergeFileInput = document.getElementById("importMergeFileInput");
+const exportDataBtn = document.getElementById("exportDataBtn");
 const statusMsg = document.getElementById("statusMsg");
 const totalScansEl = document.getElementById("totalScans");
 const uniqueSerialsEl = document.getElementById("uniqueSerials");
@@ -574,15 +576,52 @@ function escapeHtml(s) {
     .replace(/'/g,"&#039;");
 }
 
-function toCSV(rows) {
-  return rows.map(row => row.map(v => {
-    const s = (v ?? "").toString();
-    return /[",\n]/.test(s) ? '"' + s.replace(/"/g,'""') + '"' : s;
-  }).join(",")).join("\n");
+function xmlEscape(value) {
+  return (value ?? "").toString()
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
 }
 
-function downloadFile(filename, content, type="text/plain;charset=utf-8") {
-  const blob = new Blob([content], {type});
+function buildSpreadsheetMlWorkbook(sheets) {
+  const workbookStart = `<?xml version="1.0"?>
+<?mso-application progid="Excel.Sheet"?>
+<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet" xmlns:html="http://www.w3.org/TR/REC-html40">
+<Styles>
+  <Style ss:ID="Default" ss:Name="Normal">
+    <Alignment ss:Vertical="Bottom"/>
+    <Borders/>
+    <Font/>
+    <Interior/>
+    <NumberFormat/>
+    <Protection/>
+  </Style>
+  <Style ss:ID="Header">
+    <Font ss:Bold="1"/>
+    <Interior ss:Color="#D9EAF7" ss:Pattern="Solid"/>
+  </Style>
+</Styles>`;
+
+  const sheetXml = sheets.map(sheet => {
+    const rowsXml = sheet.rows.map((row, rowIndex) => {
+      const cellsXml = row.map(cell => {
+        const isNum = typeof cell === "number" && Number.isFinite(cell);
+        const type = isNum ? "Number" : "String";
+        const style = rowIndex === 0 ? ` ss:StyleID="Header"` : "";
+        return `<Cell${style}><Data ss:Type="${type}">${xmlEscape(cell)}</Data></Cell>`;
+      }).join("");
+      return `<Row>${cellsXml}</Row>`;
+    }).join("\n");
+    return `<Worksheet ss:Name="${xmlEscape((sheet.name || "Sheet").slice(0, 31))}"><Table>${rowsXml}</Table></Worksheet>`;
+  }).join("\n");
+
+  return `${workbookStart}\n${sheetXml}\n</Workbook>`;
+}
+
+function downloadFile(filename, content, type = "text/plain;charset=utf-8") {
+  const blob = new Blob([content], { type });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
@@ -593,248 +632,137 @@ function downloadFile(filename, content, type="text/plain;charset=utf-8") {
   URL.revokeObjectURL(url);
 }
 
-function xmlEscape(value) {
-  return (value ?? "").toString()
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
-}
-
-const ZIP_UTF8_FLAG = 0x0800;
-const CRC32_TABLE = (() => {
-  const table = new Uint32Array(256);
-  for (let i = 0; i < 256; i++) {
-    let c = i;
-    for (let j = 0; j < 8; j++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
-    table[i] = c >>> 0;
-  }
-  return table;
-})();
-
-function crc32(bytes) {
-  let crc = 0xFFFFFFFF;
-  for (let i = 0; i < bytes.length; i++) {
-    crc = CRC32_TABLE[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8);
-  }
-  return (crc ^ 0xFFFFFFFF) >>> 0;
-}
-
-function pushUint16LE(out, value) {
-  out.push(value & 0xFF, (value >>> 8) & 0xFF);
-}
-
-function pushUint32LE(out, value) {
-  out.push(value & 0xFF, (value >>> 8) & 0xFF, (value >>> 16) & 0xFF, (value >>> 24) & 0xFF);
-}
-
-function utf8Bytes(text) {
-  return new TextEncoder().encode(text);
-}
-
-function buildZipArchive(files) {
-  const output = [];
-  const centralDirectory = [];
-  files.forEach(file => {
-    const nameBytes = utf8Bytes(file.path);
-    const dataBytes = file.bytes || utf8Bytes(file.content || "");
-    const size = dataBytes.length;
-    const crc = crc32(dataBytes);
-    const localOffset = output.length;
-
-    pushUint32LE(output, 0x04034B50);
-    pushUint16LE(output, 20);
-    pushUint16LE(output, ZIP_UTF8_FLAG);
-    pushUint16LE(output, 0);
-    pushUint16LE(output, 0);
-    pushUint16LE(output, 0);
-    pushUint32LE(output, crc);
-    pushUint32LE(output, size);
-    pushUint32LE(output, size);
-    pushUint16LE(output, nameBytes.length);
-    pushUint16LE(output, 0);
-    output.push(...nameBytes, ...dataBytes);
-
-    centralDirectory.push({ nameBytes, crc, size, localOffset });
+function parseSpreadsheetMlRowsBySheet(xmlText) {
+  const parser = new DOMParser();
+  const xml = parser.parseFromString(xmlText, "application/xml");
+  if (xml.querySelector("parsererror")) throw new Error("Invalid SpreadsheetML XML.");
+  const ns = "urn:schemas-microsoft-com:office:spreadsheet";
+  const worksheets = Array.from(xml.getElementsByTagNameNS(ns, "Worksheet"));
+  const out = [];
+  worksheets.forEach(ws => {
+    const name = ws.getAttribute("ss:Name") || ws.getAttribute("Name") || "Sheet";
+    const rowNodes = Array.from(ws.getElementsByTagNameNS(ns, "Row"));
+    const rows = rowNodes.map(row => {
+      const values = [];
+      let currentIndex = 1;
+      const cells = Array.from(row.getElementsByTagNameNS(ns, "Cell"));
+      cells.forEach(cell => {
+        const idxAttr = cell.getAttribute("ss:Index") || cell.getAttribute("Index");
+        const targetIndex = idxAttr ? Number.parseInt(idxAttr, 10) : currentIndex;
+        while (currentIndex < targetIndex) {
+          values.push("");
+          currentIndex++;
+        }
+        const dataNode = cell.getElementsByTagNameNS(ns, "Data")[0];
+        values.push(dataNode ? (dataNode.textContent || "") : "");
+        currentIndex++;
+      });
+      return values;
+    });
+    out.push({ name, rows });
   });
-
-  const centralOffset = output.length;
-  centralDirectory.forEach(entry => {
-    pushUint32LE(output, 0x02014B50);
-    pushUint16LE(output, 20);
-    pushUint16LE(output, 20);
-    pushUint16LE(output, ZIP_UTF8_FLAG);
-    pushUint16LE(output, 0);
-    pushUint16LE(output, 0);
-    pushUint16LE(output, 0);
-    pushUint32LE(output, entry.crc);
-    pushUint32LE(output, entry.size);
-    pushUint32LE(output, entry.size);
-    pushUint16LE(output, entry.nameBytes.length);
-    pushUint16LE(output, 0);
-    pushUint16LE(output, 0);
-    pushUint16LE(output, 0);
-    pushUint16LE(output, 0);
-    pushUint32LE(output, 0);
-    pushUint32LE(output, entry.localOffset);
-    output.push(...entry.nameBytes);
-  });
-
-  const centralSize = output.length - centralOffset;
-  pushUint32LE(output, 0x06054B50);
-  pushUint16LE(output, 0);
-  pushUint16LE(output, 0);
-  pushUint16LE(output, centralDirectory.length);
-  pushUint16LE(output, centralDirectory.length);
-  pushUint32LE(output, centralSize);
-  pushUint32LE(output, centralOffset);
-  pushUint16LE(output, 0);
-  return new Uint8Array(output);
-}
-
-function sanitizeXmlText(value) {
-  return xmlEscape((value ?? "").toString().replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, ""));
-}
-
-function excelColumnName(index) {
-  let n = index + 1;
-  let out = "";
-  while (n > 0) {
-    const rem = (n - 1) % 26;
-    out = String.fromCharCode(65 + rem) + out;
-    n = Math.floor((n - 1) / 26);
-  }
   return out;
 }
 
-function toXlsxSheetName(name, index, usedNames) {
-  const fallback = `Sheet${index + 1}`;
-  const baseRaw = (name ?? fallback).toString().replace(/[\\/*?:[\]]/g, " ").trim();
-  const base = (baseRaw || fallback).slice(0, 31) || fallback;
-  let candidate = base;
-  let suffixNum = 2;
-  while (usedNames.has(candidate)) {
-    const suffix = ` (${suffixNum++})`;
-    candidate = `${base.slice(0, Math.max(1, 31 - suffix.length))}${suffix}`;
-  }
-  usedNames.add(candidate);
-  return candidate;
+function normalizeImportHeader(value) {
+  return normalize(value).replace(/[^A-Z0-9]+/g, "");
 }
 
-function buildXlsxCellXml(cell, rowNum, colIndex, isHeader) {
-  const cellRef = `${excelColumnName(colIndex)}${rowNum}`;
-  const style = isHeader ? ' s="1"' : "";
-  if (typeof cell === "number" && Number.isFinite(cell)) {
-    return `<c r="${cellRef}"${style}><v>${cell}</v></c>`;
-  }
-  return `<c r="${cellRef}"${style} t="inlineStr"><is><t xml:space="preserve">${sanitizeXmlText(cell)}</t></is></c>`;
-}
+function parseRecordsFromRows(rows) {
+  if (!rows.length) return { records: [], skippedBlank: 0 };
+  const headerMap = {};
+  rows[0].forEach((h, i) => {
+    const key = normalizeImportHeader(h);
+    if (key) headerMap[key] = i;
+  });
+  const get = (row, keys) => {
+    for (const key of keys) {
+      if (headerMap[key] != null) return row[headerMap[key]] ?? "";
+    }
+    return "";
+  };
 
-function buildXlsxWorksheetXml(rows) {
-  const rowCount = Math.max(rows.length, 1);
-  const colCount = Math.max(1, ...rows.map(r => Array.isArray(r) ? r.length : 0));
-  const endRef = `${excelColumnName(colCount - 1)}${rowCount}`;
-  const sheetRows = rows.length
-    ? rows.map((row, rowIndex) => {
-        const safeRow = Array.isArray(row) ? row : [];
-        const cellsXml = safeRow.map((cell, colIndex) => buildXlsxCellXml(cell, rowIndex + 1, colIndex, rowIndex === 0)).join("");
-        return `<row r="${rowIndex + 1}">${cellsXml}</row>`;
-      }).join("")
-    : `<row r="1"><c r="A1" t="inlineStr"><is><t xml:space="preserve"></t></is></c></row>`;
+  const serialKeys = ["SERIALNUMBER", "SERIAL", "SN"];
+  const pnrKeys = ["PNR", "PNRGPN", "GPN", "PN"];
+  const initialsKeys = ["INITIALS", "USERINITIALS", "OPERATOR", "TECHNICIAN"];
+  const rackKeys = ["RACK", "RACKID", "RACKNAME"];
+  const tsKeys = ["TIMESTAMP", "TIME", "DATE", "DATETIME"];
+  const lookupKeys = ["LOOKUPFOUND", "LOOKUP", "FOUNDINLOOKUP"];
+  const duplicateKeys = ["DUPLICATE", "ISDUPLICATE"];
 
-  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-  <dimension ref="A1:${endRef}"/>
-  <sheetViews><sheetView workbookViewId="0"/></sheetViews>
-  <sheetFormatPr defaultRowHeight="15"/>
-  <sheetData>${sheetRows}</sheetData>
-</worksheet>`;
-}
+  if (!serialKeys.some(k => headerMap[k] != null)) return { records: [], skippedBlank: rows.length > 1 ? rows.length - 1 : 0 };
 
-function buildExcelWorkbookXlsx(sheets) {
-  const usedNames = new Set();
-  const normalizedSheets = sheets.map((sheet, idx) => ({
-    name: toXlsxSheetName(sheet?.name, idx, usedNames),
-    rows: Array.isArray(sheet?.rows) ? sheet.rows : []
-  }));
-
-  const workbookXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
-  <sheets>
-    ${normalizedSheets.map((sheet, idx) => `<sheet name="${sanitizeXmlText(sheet.name)}" sheetId="${idx + 1}" r:id="rId${idx + 1}"/>`).join("")}
-  </sheets>
-</workbook>`;
-
-  const workbookRelsXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  ${normalizedSheets.map((_, idx) => `<Relationship Id="rId${idx + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${idx + 1}.xml"/>`).join("")}
-  <Relationship Id="rId${normalizedSheets.length + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
-</Relationships>`;
-
-  const contentTypesXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
-  <Default Extension="xml" ContentType="application/xml"/>
-  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
-  ${normalizedSheets.map((_, idx) => `<Override PartName="/xl/worksheets/sheet${idx + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join("")}
-  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
-</Types>`;
-
-  const rootRelsXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
-</Relationships>`;
-
-  const stylesXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-  <fonts count="2">
-    <font><sz val="11"/><name val="Calibri"/><family val="2"/></font>
-    <font><b/><sz val="11"/><name val="Calibri"/><family val="2"/></font>
-  </fonts>
-  <fills count="3">
-    <fill><patternFill patternType="none"/></fill>
-    <fill><patternFill patternType="gray125"/></fill>
-    <fill><patternFill patternType="solid"><fgColor rgb="FFD9EAF7"/><bgColor indexed="64"/></patternFill></fill>
-  </fills>
-  <borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>
-  <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
-  <cellXfs count="2">
-    <xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
-    <xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/>
-  </cellXfs>
-  <cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
-</styleSheet>`;
-
-  const files = [
-    { path: "[Content_Types].xml", content: contentTypesXml },
-    { path: "_rels/.rels", content: rootRelsXml },
-    { path: "xl/workbook.xml", content: workbookXml },
-    { path: "xl/_rels/workbook.xml.rels", content: workbookRelsXml },
-    { path: "xl/styles.xml", content: stylesXml }
-  ];
-
-  normalizedSheets.forEach((sheet, idx) => {
-    files.push({
-      path: `xl/worksheets/sheet${idx + 1}.xml`,
-      content: buildXlsxWorksheetXml(sheet.rows)
+  let skippedBlank = 0;
+  const records = [];
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i];
+    const serial = normalize(get(row, serialKeys));
+    if (!serial) {
+      skippedBlank++;
+      continue;
+    }
+    const rawLookup = normalize(get(row, lookupKeys));
+    const rawDup = normalize(get(row, duplicateKeys));
+    records.push({
+      ts: (get(row, tsKeys) || "").toString().trim() || nowStamp(),
+      serial,
+      pnr: normalize(get(row, pnrKeys)),
+      initials: normalize(get(row, initialsKeys)),
+      rack: normalize(get(row, rackKeys)),
+      lookupFound: rawLookup === "YES" || rawLookup === "TRUE" || rawLookup === "1",
+      duplicate: rawDup === "YES" || rawDup === "TRUE" || rawDup === "1"
     });
+  }
+  return { records, skippedBlank };
+}
+
+function mergeImportedRecords(records, skippedBlank = 0) {
+  const bySerial = new Map(scans.map(row => [normalize(row.serial), row]));
+  let added = 0;
+  let updated = 0;
+  let skippedDupes = 0;
+
+  records.forEach(record => {
+    const key = normalize(record.serial);
+    if (!key) return;
+    const existing = bySerial.get(key);
+    if (!existing) {
+      const lookedUp = normalize(SERIAL_TO_PNR[key] || "");
+      scans.push({
+        ts: record.ts || nowStamp(),
+        serial: key,
+        pnr: record.pnr || lookedUp,
+        initials: record.initials || "",
+        rack: record.rack || "",
+        lookupFound: record.lookupFound || !!lookedUp,
+        duplicate: !!record.duplicate
+      });
+      bySerial.set(key, scans[scans.length - 1]);
+      added++;
+      return;
+    }
+
+    let changed = false;
+    if (!existing.pnr && record.pnr) { existing.pnr = record.pnr; changed = true; }
+    if (!existing.initials && record.initials) { existing.initials = record.initials; changed = true; }
+    if (!existing.rack && record.rack) { existing.rack = record.rack; changed = true; }
+    if (!existing.ts && record.ts) { existing.ts = record.ts; changed = true; }
+    if (record.lookupFound && !existing.lookupFound) { existing.lookupFound = true; changed = true; }
+    if (record.duplicate && !existing.duplicate) { existing.duplicate = true; changed = true; }
+    if (changed) updated++;
+    else skippedDupes++;
   });
 
-  return buildZipArchive(files);
+  persistScans();
+  renderAll();
+  setStatus(`Merge complete. Added ${added}, updated ${updated}, skipped ${skippedDupes} duplicates, skipped ${skippedBlank} blank row(s).`, (added || updated) ? "ok" : "warn");
 }
 
-
-document.getElementById("exportSummaryBtn").addEventListener("click", () => {
-  const summaryRows = [["PN-R","Count"]];
-  for (const row of getSummaryRows()) {
-    summaryRows.push([row.pnr, row.count]);
-  }
-
+function exportDataWorkbook() {
+  const summaryRows = [["PN-R", "Count"], ...getSummaryRows().map(r => [r.pnr, r.count])];
   const rackRows = [["Rack","Timestamp","Serial Number","PN-R","Initials","Duplicate","Lookup Found"]];
-  for (const group of getRackGroups()) {
-    const rows = group.rows.slice().reverse();
-    rows.forEach((r, idx) => {
+  getRackGroups().forEach(group => {
+    group.rows.slice().reverse().forEach((r, idx) => {
       rackRows.push([
         idx === 0 ? group.rack : "",
         r.ts || "",
@@ -845,29 +773,54 @@ document.getElementById("exportSummaryBtn").addEventListener("click", () => {
         r.lookupFound ? "Yes" : "No"
       ]);
     });
-  }
-  if (rackRows.length === 1) {
-    rackRows.push(["(No racks scanned)","","","","","",""]);
-  }
+  });
+  if (rackRows.length === 1) rackRows.push(["(No racks scanned)","","","","","",""]);
 
-  const workbookXlsx = buildExcelWorkbookXlsx([
+  const mergeRows = [["Timestamp","Serial Number","PN-R","Initials","Rack","Lookup Found","Duplicate"]];
+  scans.forEach(r => mergeRows.push([
+    r.ts || "",
+    r.serial || "",
+    r.pnr || "",
+    r.initials || "",
+    r.rack || "",
+    r.lookupFound ? "Yes" : "No",
+    r.duplicate ? "Yes" : "No"
+  ]));
+
+  const workbook = buildSpreadsheetMlWorkbook([
     { name: "Summary By PN-R", rows: summaryRows },
-    { name: "Racks", rows: rackRows }
+    { name: "Racks", rows: rackRows },
+    { name: "Merge Data", rows: mergeRows }
   ]);
+  downloadFile(`inventory_merge_${Date.now()}.xls`, workbook, "application/vnd.ms-excel;charset=utf-8");
+  setStatus("Exported merge workbook (.xls) with Summary, Racks, and Merge Data sheets.", "ok");
+}
 
-  downloadFile("inventory_summary.xlsx", workbookXlsx, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-  setStatus("Exported Excel .xlsx file with Summary By PN-R and Racks sheets.", "ok");
-});
-
-document.getElementById("copySummaryBtn").addEventListener("click", async () => {
-  const text = toCSV([["PN-R","Count"], ...getSummaryRows().map(r=>[r.pnr, r.count])]);
+async function handleImportMergeFile(file) {
+  if (!file) return;
   try {
-    await navigator.clipboard.writeText(text);
-    setStatus("Summary copied to clipboard (CSV format).", "ok");
-  } catch {
-    setStatus("Clipboard copy failed in this browser. Use Export Excel (.xlsx) instead.", "warn");
+    const text = (await file.text()).replace(/^﻿/, "");
+    const sheets = parseSpreadsheetMlRowsBySheet(text);
+    if (!sheets.length) {
+      setStatus("Import failed. No sheets found in the selected file.", "err");
+      return;
+    }
+    let target = sheets.find(s => /merge data/i.test(s.name));
+    if (!target) target = sheets.find(s => /racks|exported scans/i.test(s.name));
+    if (!target) target = sheets[0];
+    const { records, skippedBlank } = parseRecordsFromRows(target.rows || []);
+    if (!records.length) {
+      setStatus("Import failed. No readable scan rows were found in the file.", "err");
+      return;
+    }
+    mergeImportedRecords(records, skippedBlank);
+  } catch (e) {
+    console.error(e);
+    setStatus(`Import failed. ${(e && e.message) ? e.message : "The file could not be read."}`, "err");
+  } finally {
+    if (importMergeFileInput) importMergeFileInput.value = "";
   }
-});
+}
 
 let autoSubmitTimer = null;
 function cancelAutoSubmitTimer() {
@@ -957,6 +910,11 @@ addRackBtn.addEventListener("click", addRack);
 addBtn.addEventListener("click", addEntry);
 undoBtn.addEventListener("click", undoLast);
 clearBtn.addEventListener("click", clearAll);
+if (exportDataBtn) exportDataBtn.addEventListener("click", exportDataWorkbook);
+if (importMergeBtn && importMergeFileInput) {
+  importMergeBtn.addEventListener("click", () => importMergeFileInput.click());
+  importMergeFileInput.addEventListener("change", (e) => handleImportMergeFile(e.target.files?.[0] || null));
+}
 if (filterInput) filterInput.addEventListener("input", renderDetails);
 
 if (racksTbody) {
